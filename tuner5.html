@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Afinador de Violín Minimalista</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    /* Se ha quitado la transición del body para un cambio de color instantáneo */
+    .bar-indicator {
+      position: absolute;
+      top: 0; height: 100%; width: 4px; background: white; border-radius: 4px;
+      transform: translateX(-50%); /* Centra el indicador en su posición */
+      transition: left 0.1s ease-out;
+    }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col items-center justify-center p-4 bg-gray-900">
+
+  <div class="max-w-4xl w-full flex flex-col items-center justify-center text-center">
+    
+    <div id="note-display" class="text-[20rem] font-bold text-white leading-none">--</div>
+    
+    <div id="freq-display" class="text-2xl text-white/80 mt-4">0.00 Hz</div>
+    <div id="cents-display" class="text-xl text-white/90 font-semibold mb-8">+0 cents</div>
+
+    <div class="w-full max-w-2xl px-4">
+      <div class="relative h-12 bg-white/10 rounded-full overflow-hidden">
+        <div class="absolute inset-0 flex items-center justify-center">
+          <div class="w-1 h-full bg-white/50"></div>
+        </div>
+        <div id="cents-bar" class="bar-indicator" style="left: 50%;"></div>
+      </div>
+      <div class="flex justify-between text-white/60 text-sm px-2 mt-2">
+        <span>-50</span><span>0</span><span>+50</span>
+      </div>
+    </div>
+
+  </div>
+
+  <script>
+    const VIOLIN_STRINGS = { 'G': 196.00, 'D': 293.66, 'A': 440.00, 'E': 659.25 };
+    const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+
+    let audioContext, analyser, microphone, buffer;
+
+    const noteDisplay = document.getElementById('note-display');
+    const freqDisplay = document.getElementById('freq-display');
+    const centsDisplay = document.getElementById('cents-display');
+    const centsBar = document.getElementById('cents-bar');
+    const bodyEl = document.body;
+
+    function parabolicInterpolation(a, b, c) {
+      const numerator = 0.5 * (a - c);
+      const denominator = a - 2 * b + c;
+      return denominator === 0 ? 0 : numerator / denominator;
+    }
+
+    function detectPitch(buffer, sampleRate) {
+      const len = buffer.length;
+      const yinBuffer = new Float32Array(Math.floor(len / 2));
+      let tauEstimate = -1;
+
+      for (let tau = 0; tau < yinBuffer.length; tau++) {
+        let sum = 0;
+        for (let i = 0; i < yinBuffer.length; i++) {
+          const delta = buffer[i] - buffer[i + tau];
+          sum += delta * delta;
+        }
+        yinBuffer[tau] = sum;
+      }
+
+      let runningSum = 0;
+      yinBuffer[0] = 1;
+      for (let tau = 1; tau < yinBuffer.length; tau++) {
+        runningSum += yinBuffer[tau];
+        if (runningSum === 0) {
+            yinBuffer[tau] = 1;
+        } else {
+            yinBuffer[tau] *= tau / runningSum;
+        }
+      }
+
+      const threshold = 0.1;
+      for (let tau = 2; tau < yinBuffer.length; tau++) {
+        if (yinBuffer[tau] < threshold) {
+          while (tau + 1 < yinBuffer.length && yinBuffer[tau + 1] < yinBuffer[tau]) {
+            tau++;
+          }
+          tauEstimate = tau;
+          break;
+        }
+      }
+
+      if (tauEstimate === -1) {
+        let minVal = Infinity;
+        for (let tau = 2; tau < yinBuffer.length; tau++) {
+          if (yinBuffer[tau] < minVal) {
+            minVal = yinBuffer[tau];
+            tauEstimate = tau;
+          }
+        }
+      }
+      
+      if (tauEstimate > 0 && tauEstimate < yinBuffer.length - 1) {
+        const betterTau = tauEstimate + parabolicInterpolation(yinBuffer[tauEstimate - 1], yinBuffer[tauEstimate], yinBuffer[tauEstimate + 1]);
+        return sampleRate / betterTau;
+      }
+
+      return sampleRate / tauEstimate;
+    }
+    
+    function frequencyToNote(freq) {
+      if (!freq || freq < 20 || freq > 4000) return null;
+      const noteNum = 12 * (Math.log2(freq / 440)) + 69;
+      const rounded = Math.round(noteNum);
+      const cents = Math.round((noteNum - rounded) * 100);
+      const name = NOTE_NAMES[rounded % 12];
+      return { name, cents, freq };
+    }
+
+    async function startTuner() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+        audioContext = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive', sampleRate: 44100 });
+        microphone = audioContext.createMediaStreamSource(stream);
+
+        const lowpass = audioContext.createBiquadFilter(); lowpass.type = 'lowpass'; lowpass.frequency.value = 3500;
+        const highpass = audioContext.createBiquadFilter(); highpass.type = 'highpass'; highpass.frequency.value = 150;
+
+        analyser = audioContext.createAnalyser();
+        analyser.fftSize = 4096;
+        analyser.smoothingTimeConstant = 0;
+
+        microphone.connect(highpass).connect(lowpass).connect(analyser);
+        buffer = new Float32Array(analyser.fftSize);
+        analyzeAudio();
+      } catch (e) {
+        alert('Se necesita acceso al micrófono para que el afinador funcione. Por favor, refresca la página y permite el acceso.');
+        console.error(e);
+      }
+    }
+
+    function analyzeAudio() {
+      analyser.getFloatTimeDomainData(buffer);
+      const rms = Math.sqrt(buffer.reduce((sum, val) => sum + val * val, 0) / buffer.length);
+
+      if (rms > 0.01) { // Umbral de sensibilidad para detectar sonido
+        const freq = detectPitch(buffer, audioContext.sampleRate);
+        if (freq >= 150 && freq <= 3500) {
+          const noteInfo = frequencyToNote(freq);
+          if (noteInfo) {
+            noteDisplay.textContent = noteInfo.name;
+            freqDisplay.textContent = freq.toFixed(2) + ' Hz';
+            centsDisplay.textContent = (noteInfo.cents >= 0 ? '+' : '') + noteInfo.cents + ' cents';
+            
+            const centsAbs = Math.abs(noteInfo.cents);
+            if (centsAbs <= 5) {
+              bodyEl.style.backgroundColor = '#166534'; // Verde oscuro (en tono)
+            } else if (centsAbs <= 15) {
+              bodyEl.style.backgroundColor = '#991b1b'; // Amarillo oscuro (casi)
+            } else {
+              bodyEl.style.backgroundColor = '#991b1b'; // Rojo oscuro (desafinado)
+            }
+            
+            const barPosition = Math.max(0, Math.min(100, 50 + noteInfo.cents));
+            centsBar.style.left = `${barPosition}%`;
+          }
+        }
+      }
+      // Se ha eliminado el 'else'. Si no hay sonido (rms < 0.01), no se hace nada,
+      // dejando el último estado visible en la pantalla.
+      
+      requestAnimationFrame(analyzeAudio);
+    }
+
+    startTuner();
+  </script>
+</body>
+</html>
